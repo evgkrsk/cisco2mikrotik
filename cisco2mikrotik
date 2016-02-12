@@ -1,0 +1,513 @@
+#!/usr/bin/python
+# -*- mode: python; coding: utf-8 -*-
+
+from pprint import pprint
+import sys
+import argparse
+import re
+from ciscoconfparse import CiscoConfParse, CiscoPassword
+from ipaddr import IPv4Network,IPv4Address, AddressValueError
+
+parser = argparse.ArgumentParser(description='Конвертирует конфигурацию Cisco IOS в конфигурацию Mikrotik', add_help=False)
+parser.add_argument('-c', '--config', help='Конвертировать указанный конфиг вместо стандартного ввода', default="-")
+parser.add_argument('-o', '--output', help='Выводить в указанный файл вместо стандартного вывода', default="-")
+parser.add_argument('-m', '--map', action='append', nargs=2, help='Ручной маппинг интерфейсов')
+parser.add_argument('-a', '--ipv4map', action='append', nargs=2, help='Ручной маппинг IPv4 адресов')
+parser.add_argument('-h', '--help', action='help', help='Показать это сообщение и выйти')
+args = parser.parse_args()
+
+ipv4map = {}                    # {"10.100.2.70": "10.100.1.11", ...}
+if args.ipv4map:
+    for m in args.ipv4map:
+        ipv4map[m[0]] = m[1]
+
+if args.config == "-":
+    parse = CiscoConfParse(sys.stdin.readlines())
+else:
+    parse = CiscoConfParse(args.config)
+
+mk = CiscoConfParse([""])
+mk.append_line("# Args: %s" % sys.argv)
+mk.commit()
+
+def map_interfaces_names(names):
+    "Maps list of physical Cisco interface names to dict of Mikrotik one"
+    result = {}
+    ifaces = filter(lambda x: r"Ether" in x and r"." not in x, names)
+    if not ifaces: return result
+    num = 1
+    ifaces.sort()
+    for i in ifaces:
+        result[i] = "ether%s" % num
+        num += 1
+    return result
+
+def physical_interface_name(name):
+    """Return physical interface name, stripped from full name
+    i.e.: FastEthernet0/0 => FastEthernet0/0
+    GigabitEthernet0.10   => GigabitEthernet0
+    Ethernet0/1.1024      => Ethernet0/1
+    """
+    return name.split(r".")[0]
+
+def add_ip_address(ccp,child,name):
+    """Add IPv4 address of " ip address x.x.x.x y.y.y.y" directive
+    from CHILD object to interface NAME
+    and output it in CCP parser
+    returns None
+    """
+    ipmask = re.search(r"ip address ([0-9.]+) ([0-9.]+)",child.text)
+    if ipmask:
+        ip,mask = ipmask.groups()
+        IPv4Network("%s/%s" % (ip,mask))
+        if ipv4map.has_key(ip):
+            ip = ipv4map[ip]
+        ccp.append_line(r"/ip address add address=%s netmask=%s interface=%s" % (ip,mask,name))
+        ccp.commit()
+
+def get_description(child):
+    "Return description string or None"
+    desc = re.search(r"^ *description (.+)$", child.text)
+    if desc:
+        result = desc.group(1)
+        assert result
+        return result
+    else:
+        return None
+
+################## Main part follows ################################################################################
+all_interfaces = parse.find_objects(r"^interface ")
+interfaces_map = map_interfaces_names(map(lambda x: x.text.strip().split()[-1], all_interfaces))
+if args.map:                    # list of lists
+    for lst in args.map:
+        if interfaces_map.has_key(lst[0]):
+            interfaces_map[lst[0]] = lst[1]
+mk.append_line(r"# Interface map:")
+for i in interfaces_map.keys():
+    mk.append_line(r"# %s => %s" % (i,interfaces_map[i]))
+mk.commit()
+
+########################## Loopbacks ################################################################################
+lo_interfaces = parse.find_objects(r"^interface Loopback")
+for interface in lo_interfaces:
+    interface_name = interface.text.strip().split()[-1]
+    assert interface_name
+    mk.append_line(r"# interface: %s" % interface_name)
+    mk.commit()
+    shutdown = interface.has_child_with(r"^ *shutdown$")
+    vrf = interface.has_child_with(r"ip vrf forwarding")
+    if shutdown or vrf:
+        mk.append_line(r"# Interface shutted down or in VRF: %s" % interface_name)
+        mk.commit()
+        continue
+    mk.append_line(r"/interface bridge add name=%s protocol-mode=none" % interface_name)
+    mk.commit()
+    for child in interface.children:
+        add_ip_address(mk,child,interface_name)
+        description = get_description(child)
+        if description:
+            mk.append_line(r'/interface bridge set [ find name=%s ] comment="%s"' % (interface_name,description))
+            mk.commit()
+
+############## Normal Ethernet interfaces ###########################################################################
+eth_interfaces = parse.find_objects(r"^interface .*[Ee]thernet")
+for interface in eth_interfaces:
+    interface_name = interface.text.strip().split()[-1]
+    assert interface_name
+    mk.append_line(r"# interface: %s" % interface_name)
+    mk.commit()
+    interface_type = r"ethernet"
+    physical_name = ""
+    vid = None
+    description = ""
+
+    if interfaces_map.has_key(interface_name): # physical interface
+        physical_name = interfaces_map[interface_name]
+
+    shutdown = interface.has_child_with(r"^ *shutdown$")
+    vrf = interface.has_child_with(r"ip vrf forwarding")
+    if shutdown or vrf:
+        mk.append_line(r"# Interface shutted down or in VRF: %s" % interface_name)
+        mk.commit()
+        continue
+
+    if physical_name:
+        mk.append_line(r"/interface %s set [ find default-name=%s ] name=%s disabled=no" % (interface_type,physical_name,interface_name))
+        mk.commit()
+
+    for child in interface.children:
+        desc = get_description(child)
+        if desc and not description:
+            description = desc
+        dot1q = re.search(r"encapsulation dot1Q ([0-9]+)",child.text)
+        if dot1q:
+            vid = int(dot1q.group(1))
+            assert vid >= 1 and vid <= 4095
+            interface_type = r"vlan"
+            line = r"/interface %s add interface=%s name=%s vlan-id=%s" % (interface_type,physical_interface_name(interface_name),interface_name,vid)
+            if description: line = line + ' comment="%s"' % description
+            mk.append_line(line)
+            mk.commit()
+        add_ip_address(mk,child,interface_name)
+
+    if physical_name and description:
+        mk.append_line(r'/interface %s set [ find default-name=%s ] comment="%s"' % (interface_type,physical_name,description))
+        mk.commit()
+
+############## IPv4 routes ###########################################################################################
+routes = parse.find_objects(r"^ip route [0-9. ]+")
+for route in routes:
+        ip,mask,gw = route.text.strip().split()[2:5]
+        assert ip and mask and gw
+        if "Null" in gw:
+            mk.append_line(r'/ip route add dst-address=%s type=blackhole' % str(IPv4Network("%s/%s" % (ip,mask))))
+        else:
+            try:
+                IPv4Address(gw)
+                mk.append_line(r'/ip route add dst-address=%s gateway=%s' % (str(IPv4Network("%s/%s" % (ip,mask))),gw))
+            except:
+                pass            # TODO: add support for interface/proxy-arp routes
+        mk.commit()
+
+############## in/out ACL on interfaces  #############################################################################
+in_acls = {}                    # {"Loopback0": "acl_1"}
+out_acls = {}                   # {"GigabitEthernet0/0": "uplink_out"}
+acl_interfaces = parse.find_objects_w_child(parentspec=r"^interface ", childspec=r" ip access-group ")
+for interface in acl_interfaces:
+    for child in interface.children:
+        if " ip access-group " not in child.text: continue
+        acl,direction = child.text.strip().split()[2:5]
+        if acl in ("input", "output", "forward"):
+            print >>sys.stderr, "Ignoring standard-named chain %s for safety reasons" % acl
+            continue
+        if direction == "in":
+            in_acls[interface.text.strip().split()[1]] = acl
+        elif direction == "out":
+            out_acls[interface.text.strip().split()[1]] = acl
+        else:
+            print >>sys.stderr, 'Unknown access-group direction: "%s" (type %s)' % (direction,type(direction))
+
+############## ACL-s  ################################################################################################
+# now when we know used ACL-s, we can convert only needs parts of config
+# we convert one ACL to one iptable's chain
+
+action_dict = {"permit":"accept","deny":"drop"}
+acls_dict = {}                  # {"1": ["/ip firewall filter add chain=1 action=drop"], "99":["/ip firewall filter add chain=99 src-address=192.168.1.0/24 log=yes action=accept", "/ip firewall filter add chain=99 action=drop"]}
+
+# standard numbered ACL-s:
+# access-list 2 deny 192.168.200.0 0.0.0.255 => /ip firewall filter add chain=2 action=drop src-address=192.168.200.0/24
+all_acls = parse.find_objects(r"^access-list ([1-9]|[1-9][0-9]) ") # Cisco ASA have "access-list FOOBAR" syntax for ACL-s, ignore it
+for acl_line in all_acls:
+    result = "/ip firewall filter add" # result output string
+    full_acl = acl_line.text.strip().split()
+    del full_acl[0]             # cut "access-list" in head
+
+    acl_num = full_acl[0]
+    if acl_num not in in_acls.values() and acl_num not in out_acls.values():
+        continue                # skip not used ACL-s
+    else:
+        result += " chain=%s" % acl_num
+    del full_acl[0]
+
+    if not acls_dict.has_key(acl_num):
+        acls_dict[acl_num] = []
+
+    acl_action = full_acl[0]
+    try:
+        action = action_dict[acl_action]
+    except KeyError:
+        print >>sys.stderr, "Unknown action: %s in ACL %s, ignoring" % (acl_action,acl_line.text.strip())
+        continue                # skip that acl
+    result += " action=%s" % action
+    del full_acl[0]
+
+    if full_acl[-1] in ('log','log-input'):   # logging
+        result += " log=yes"
+        del full_acl[-1]
+
+    acl_src = full_acl[0]
+    if acl_src != "any":
+        if len(full_acl) == 1:  # access-list 23 permit 1.1.1.1
+            result += " src-address=%s" % acl_src
+        elif len(full_acl) == 2: # access-list 23 deny 1.1.1.0 0.0.0.255
+            result += " src-address=%s" % str(IPv4Network("%s/%s" % (full_acl[0],full_acl[1])))
+        else:
+            print >>sys.stderr, "Unknown ACL: %s, stopping" % full_acl
+            sys.exit(2)
+    acls_dict[acl_num].append(result)
+
+# extended numbered ACL-s:
+# access-list 100 permit ip host 192.168.200.2 any => /ip firewall filter add chain=100 action=accept src-address=192.168.200.2
+# access-list 2699 permit ip host 192.168.200.7 host 192.168.142.44 => /ip firewall filter add chain=2699 action=accept src-address=192.168.200.7 dst-address=192.168.142.44
+# access-list 100 deny   tcp any host 192.168.230.21 eq www => /ip firewall filter add chain=100 action=drop dst-address=192.168.230.21
+services_dict = {
+    "www": 80,
+    "domain": 53,
+    "smtp": 25,
+    "ftp": 21,
+    "https": 443,
+    "echo": 7,
+    "ftp-data": 20,
+    "netbios-ss": 139,
+    "snmp": 161,
+    "snmptrap": 162,
+    "telnet": 23,
+    "ntp": 123,
+    "pop": 110,
+    "imap": 143,
+}
+protocols_dict = {
+    "esp": "ipsec-esp",
+    "ipinip": "ipip",
+    "ahp": "ipsec-ah",
+}
+ext_acl_re = r"access-list (?P<acl_num>[1-9][0-9][0-9]+) (?P<action>(deny|permit)) +(?P<protocol>(ip|tcp|udp|icmp|gre|esp|ipinip|ahp|igmp|ospf|pim)) (?P<src>(any|((host|[0-9.]+) [0-9.]+)))(?P<srcport> (eq|lt|gt) [^ ]+)? (?P<dst>(any|((host|[0-9.]+) [0-9.]+)))(?P<dstport> (eq|lt|gt) [^ ]+)?(?P<log> log(-input)?)?$"
+all_acls = parse.find_objects(r"^access-list [1-9][0-9][0-9]+ ")
+for acl_line in all_acls:
+    result = "/ip firewall filter add" # result output string
+    m = re.match(ext_acl_re, acl_line.text.strip())
+    if not m:
+        print >>sys.stderr, "Spiritous ACL line: %s" % acl_line.text
+        continue
+
+    acl_num = m.group('acl_num')
+    if acl_num not in in_acls.values() and acl_num not in out_acls.values():
+        continue                # skip not used ACL-s
+    else:
+        result += " chain=%s" % acl_num
+
+    if not acls_dict.has_key(acl_num):
+        acls_dict[acl_num] = []
+
+    acl_action = m.group('action')
+    try:
+        action = action_dict[acl_action]
+    except KeyError:
+        print >>sys.stderr, "Unknown action: %s in ACL %s, ignoring" % (acl_action,acl_line.text.strip())
+        continue                # skip that acl
+    result += " action=%s" % action
+
+    if m.group('log'):   # logging enabled
+        result += " log=yes"
+
+    try: acl_proto = protocols_dict[m.group('protocol')]
+    except KeyError: acl_proto = m.group('protocol')
+    if acl_proto != 'ip':
+        result += " protocol=%s" % acl_proto
+
+    acl_src = m.group('src')
+    if acl_src != "any":
+        src_list = acl_src.split()
+        try:
+            src = str(IPv4Network("%s/%s" % (src_list[0],src_list[1]))) # 192.168.1.0 0.0.0.255
+        except AddressValueError:
+            src = src_list[1]   # host 192.168.1.1
+        result += " src-address=%s" % src
+
+    acl_src_port = m.group('srcport')
+    if acl_src_port:
+        rule,port = acl_src_port.split()
+        try:
+            src_port = int(port)
+        except ValueError:
+            src_port = int(services_dict[port])
+        if rule == "eq":
+            result += " src-port=%s" % src_port
+        elif rule == "lt":
+            result += " src-port=1-%s" % src_port
+        elif rule == "gt":
+            result += " src-port=%s-65535" % src_port
+        else:
+            print >>sys.stderr, "Unknown port compare rule: %s" % rule
+
+    acl_dst = m.group('dst')
+    if acl_dst != "any":
+        dst_list = acl_dst.split()
+        try:
+            dst = str(IPv4Network("%s/%s" % (dst_list[0],dst_list[1]))) # 192.168.1.0 0.0.0.255
+        except AddressValueError:
+            dst = dst_list[1]   # host 192.168.1.1
+        result += " dst-address=%s" % dst
+
+    acl_dst_port = m.group('dstport')
+    if acl_dst_port:
+        rule,port = acl_dst_port.split()
+        try:
+            dst_port = int(port)
+        except ValueError:
+            dst_port = int(services_dict[port])
+        if rule == "eq":
+            result += " dst-port=%s" % dst_port
+        elif rule == "lt":
+            result += " dst-port=1-%s" % dst_port
+        elif rule == "gt":
+            result += " dst-port=%s-65535" % dst_port
+        else:
+            print >>sys.stderr, "Unknown port compare rule: %s" % rule
+
+    acls_dict[acl_num].append(result)
+
+# standard ACL-s:
+all_acls = parse.find_objects_w_child(parentspec=r"^ip access-list standard [^ ]+", childspec=r"(permit|deny)")
+for acl_line in all_acls:
+    acl_name = acl_line.text.strip().split()[-1]
+    if acl_name not in in_acls.values() and acl_name not in out_acls.values():
+        continue                # skip not used ACL-s
+    acls_dict[acl_name] = []
+    for child in acl_line.children:
+        result = "/ip firewall filter add chain=%s" % acl_name # result output string
+        full_acl = child.text.strip().split()
+
+        acl_action = full_acl[0]
+        try:
+            action = action_dict[acl_action]
+        except KeyError:
+            print >>sys.stderr, "Unknown action: %s in ACL %s, ignoring" % (acl_action,child.text.strip())
+            continue                # skip that acl line
+        result += " action=%s" % action
+        del full_acl[0]
+
+        if full_acl[-1] in ('log','log-input'):   # logging
+            result += " log=yes"
+            del full_acl[-1]
+
+        acl_src = full_acl[0]
+        if acl_src != "any":
+            if len(full_acl) == 1:
+                result += " src-address=%s" % acl_src
+            elif len(full_acl) == 2:
+                result += " src-address=%s" % str(IPv4Network("%s/%s" % (full_acl[0],full_acl[1])))
+            else:
+                print >>sys.stderr, "Unknown ACL: %s, stopping" % full_acl
+                sys.exit(2)
+        acls_dict[acl_name].append(result)
+
+# extended ACL-s:
+ext_acl_re = r"(?P<action>(deny|permit)) +(?P<protocol>(ip|tcp|udp|icmp|gre|esp|ipinip|ahp|igmp|ospf|pim)) (?P<src>(any|((host|[0-9.]+) [0-9.]+)))(?P<srcport> (eq|lt|gt) [^ ]+)? (?P<dst>(any|((host|[0-9.]+) [0-9.]+)))(?P<dstport> (eq|lt|gt) [^ ]+)?(?P<log> log(-input)?)?$"
+all_acls = parse.find_objects_w_child(parentspec=r"^ip access-list extended [^ ]+", childspec=r"(permit|deny)")
+for acl_line in all_acls:
+    acl_name = acl_line.text.strip().split()[-1]
+    if acl_name not in in_acls.values() and acl_name not in out_acls.values():
+        continue                # skip not used ACL-s
+    for child in acl_line.children:
+        result = "/ip firewall filter add chain=%s" % acl_name # result output string
+        m = re.match(ext_acl_re, child.text.strip())
+        if not m:
+            print >>sys.stderr, "Spiritous ACL line: %s" % child.text
+            continue
+
+        if not acls_dict.has_key(acl_name):
+            acls_dict[acl_name] = []
+
+        acl_action = m.group('action')
+        try:
+            action = action_dict[acl_action]
+        except KeyError:
+            print >>sys.stderr, "Unknown action: %s in ACL %s, ignoring" % (acl_action,child.text.strip())
+            continue                # skip that acl
+        result += " action=%s" % action
+
+        if m.group('log'):   # logging enabled
+            result += " log=yes"
+
+        try: acl_proto = protocols_dict[m.group('protocol')]
+        except KeyError: acl_proto = m.group('protocol')
+        if acl_proto != 'ip':
+            result += " protocol=%s" % acl_proto
+
+        acl_src = m.group('src')
+        if acl_src != "any":
+            src_list = acl_src.split()
+            try:
+                src = str(IPv4Network("%s/%s" % (src_list[0],src_list[1]))) # 192.168.1.0 0.0.0.255
+            except AddressValueError:
+                src = src_list[1]   # host 192.168.1.1
+            result += " src-address=%s" % src
+
+        acl_src_port = m.group('srcport')
+        if acl_src_port:
+            rule,port = acl_src_port.split()
+            try:
+                src_port = int(port)
+            except ValueError:
+                src_port = int(services_dict[port])
+            if rule == "eq":
+                result += " src-port=%s" % src_port
+            elif rule == "lt":
+                result += " src-port=1-%s" % src_port
+            elif rule == "gt":
+                result += " src-port=%s-65535" % src_port
+            else:
+                print >>sys.stderr, "Unknown port compare rule: %s" % rule
+
+        acl_dst = m.group('dst')
+        if acl_dst != "any":
+            dst_list = acl_dst.split()
+            try:
+                dst = str(IPv4Network("%s/%s" % (dst_list[0],dst_list[1]))) # 192.168.1.0 0.0.0.255
+            except AddressValueError:
+                dst = dst_list[1]   # host 192.168.1.1
+            result += " dst-address=%s" % dst
+
+        acl_dst_port = m.group('dstport')
+        if acl_dst_port:
+            rule,port = acl_dst_port.split()
+            try:
+                dst_port = int(port)
+            except ValueError:
+                dst_port = int(services_dict[port])
+            if rule == "eq":
+                result += " dst-port=%s" % dst_port
+            elif rule == "lt":
+                result += " dst-port=1-%s" % dst_port
+            elif rule == "gt":
+                result += " dst-port=%s-65535" % dst_port
+            else:
+                print >>sys.stderr, "Unknown port compare rule: %s" % rule
+
+        acls_dict[acl_name].append(result)
+
+# Add final deny-s:
+t_final = "/ip firewall filter add chain=%s action=drop" 
+for acl_name in acls_dict.keys():
+    if acls_dict[acl_name][-1] == "/ip firewall filter add chain=%s action=accept" % acl_name:
+        pass                    # dont add default rule
+    elif acls_dict[acl_name][-1] != t_final % acl_name:
+        acls_dict[acl_name].append(t_final % acl_name)
+
+# add all ACL to result config:
+for acl_name in acls_dict.keys():
+    for line in acls_dict[acl_name]:
+        mk.append_line(line)
+mk.commit
+
+############## Apply ACL-s  ##########################################################################################
+# Ok, lets apply ACL-s (insert jumps in iptables standard chains)
+for interface in in_acls.keys():
+    mk.append_line(r'/ip firewall filter add action=jump chain=input in-interface=%s jump-target=%s' % (interface,in_acls[interface]))
+    mk.append_line(r'/ip firewall filter add action=jump chain=forward in-interface=%s jump-target=%s' % (interface,in_acls[interface]))
+for interface in out_acls.keys():
+    mk.append_line(r'/ip firewall filter add action=jump chain=output out-interface=%s jump-target=%s' % (interface,out_acls[interface]))
+    mk.append_line(r'/ip firewall filter add action=jump chain=forward out-interface=%s jump-target=%s' % (interface,out_acls[interface]))
+mk.commit()
+
+############## Convert local users  ##################################################################################
+all_users = parse.find_objects(r"^username [^ ]+ secret 5 [^ ]+$")
+for user in all_users:
+    username = user.text.strip().split()[1]
+    mk.append_line(r'/user add name=%s group=read password=%s comment="Password is same as login. Change it!"' % (username,username))
+    mk.commit()
+
+all_users = parse.find_objects(r"^username [^ ]+ password 7 [^ ]+$")
+for user in all_users:
+    username,dummy,dummy,digest = user.text.strip().split()[1:]
+    mk.append_line(r'/user add name=%s group=full password=%s comment="Password recovered from Cisco"' % (username,CiscoPassword(digest).decrypt()))
+    mk.commit()
+
+############## Print results #########################################################################################
+if args.output == "-":
+    output = sys.stdout
+else:
+    output = open(args.output, "w")
+
+for line in mk.ioscfg: print >> output, line
